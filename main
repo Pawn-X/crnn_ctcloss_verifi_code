@@ -1,0 +1,338 @@
+import os
+import torch
+import pandas as pb
+import torchvision.transforms as transforms
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from PIL import Image
+from torch.utils.data import Subset
+from torchvision import models
+import warnings
+import itertools
+import torch.nn.functional as F
+import cv2
+import numpy as np
+import random
+
+
+# parameter----------------------------------------------------------------------------
+batch_size = 50
+learning_rate = 0.001
+EPOCH = 30
+target_len = 4
+
+# put model on gpu----------------------------------------------------------------------
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# set char-----------------------------------------------------------------------------
+CHARS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+         'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+         'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+         'u', 'v', 'w', 'x', 'y', 'z',
+         'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
+         'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
+         'U', 'V', 'W', 'X', 'Y', 'Z', '_'
+         ]
+
+#保证实验结果一致性---------------------------------------------------------------------------------
+def setup_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+setup_seed(4)
+
+# 将标志转化为对应idx---------------------------------------------------------------
+def label_to_vec(label):
+    # 将len为4的标志（其中包含大小写英文，数字）转化为张量（4*63）
+    vector = torch.zeros(4)
+    for i in range(len(label)):
+        if '0' <= label[i] <= '9':
+            num = ord(label[i]) - ord('0')
+            vector[i] = num
+
+        elif 'a' <= label[i] <= 'z':
+            num = ord(label[i]) - ord('a') + 10
+            vector[i] = num
+
+        elif 'A' <= label[i] <= 'Z':
+            num = ord(label[i]) - ord('A') + 36
+            vector[i] = num
+        elif label[i] == '_':
+            vector[i] = len(CHARS) - 1
+        else:
+            warnings.warn('wrong label')
+
+    return vector
+
+
+# construct dataset class-------------------------------------------------------------
+class Mydataset(Dataset):
+    def __init__(self, img_path, label_path, transform):
+        super(Mydataset, self).__init__()
+        self.img_path = img_path
+        # 读取存放标志的文件
+        self.label = pb.read_csv(label_path)
+        self.transform = transform
+        # 得到存放图片名称的列表
+        self.img_list = list(os.walk(img_path))[0][-1]
+
+    def __len__(self):
+        return len(self.img_list)
+
+    def __getitem__(self, item):
+        # 获取item对应的图片名
+        img_name = self.img_list[item]
+        # 读取图片，图片大小为（40，120，3）
+        image = cv2.imread(os.path.join(self.img_path, img_name))
+        #将图片转为灰度图
+        img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        #将图片大小调整为(32，96，1)
+        img = cv2.resize(img, (96, 32))
+        # 对图片进行预处理
+        if self.transform:
+            img = self.transform(img)
+        '''求出图片对应label'''
+        # 通过截取图片名定位label
+        img_num = int(img_name[:-4])
+        label = self.label.loc[img_num - 1, 'label']
+        # 通过查找对应ID值定位label
+        # label = self.label.loc[self.label['ID'] == img_name, ['label']]
+        # label = label.loc[label.index[0], 'label']
+        # label = one_hot.label_to_vec(label)
+        label = label_to_vec(label)
+
+        return img, label
+
+
+# 数据预处理，通过计算训练集的平均值和标准差分别为[0.5347096  0.52021354 0.5204144 ] [0.24421619 0.24117489 0.23763582]
+transform = transforms.Compose([transforms.ToTensor(),
+                                transforms.Normalize(mean=(0.5241428,),
+                                                     std=( 0.1834344,))])
+# 创建数据集--------------------------------------------------------------------------------------------
+img_path = 'D:\\Projects\\verifi_code_data\\data\\train'
+label_path = 'D:\\Projects\\verifi_code_data\\data\\train_label.csv'
+dat = Mydataset(img_path, label_path, transform)
+
+# 将数据集分为训练集和测试集--------------------------------------------------------------------------------
+train_dataset = Subset(dat, [i for i in range(4500)])
+test_dataset = Subset(dat, [i for i in range(4500, 5000)])
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+
+# 构建网络------------------------------------------------------------------------------------------------
+class BidirectionalLSTM(nn.Module):
+
+    def __init__(self, nInput_size, nHidden, nOut):
+        super(BidirectionalLSTM, self).__init__()
+
+        self.lstm = nn.LSTM(nInput_size, nHidden, bidirectional=True)
+        self.linear = nn.Linear(nHidden * 2, nOut)
+
+    def forward(self, input):
+        recurrent, (hidden, cell) = self.lstm(input)
+        T, b, h = recurrent.size()
+        t_rec = recurrent.view(T * b, h)
+
+        output = self.linear(t_rec)  # [T * b, nOut]
+        output = output.view(T, b, -1)  # 输出变换为[seq,batch,类别总数]
+
+        return output
+
+
+class CNN(nn.Module):
+
+    def __init__(self, imageHeight, nChannel):
+        super(CNN, self).__init__()
+        assert imageHeight % 32 == 0, 'image Height has to be a multiple of 32'
+
+        self.depth_conv0 = nn.Conv2d(in_channels=nChannel, out_channels=64, kernel_size=3, stride=1, padding=1)
+        self.relu0 = nn.ReLU(inplace=True)
+        self.pool0 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.depth_conv1 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=1, padding=1)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.depth_conv2 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=1, padding=1)
+        self.batchNorm2 = nn.BatchNorm2d(256)
+        self.relu2 = nn.ReLU(inplace=True)
+
+        self.depth_conv3 = nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, stride=1, padding=1)
+        self.relu3 = nn.ReLU(inplace=True)
+        self.pool3 = nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1))
+
+        self.depth_conv4 = nn.Conv2d(in_channels=256, out_channels=512, kernel_size=3, stride=1, padding=1)
+        self.batchNorm4 = nn.BatchNorm2d(512)
+        self.relu4 = nn.ReLU(inplace=True)
+
+        self.depth_conv5 = nn.Conv2d(in_channels=512, out_channels=512, kernel_size=3, stride=1, padding=1)
+        self.relu5 = nn.ReLU(inplace=True)
+        self.pool5 = nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1))
+
+        # self.depth_conv6 = nn.Conv2d(in_channels=512, out_channels=512, kernel_size=2, stride=1, padding=0)
+        # self.batchNorm6 = nn.BatchNorm2d(512)
+        # self.relu6 = nn.ReLU(inplace=True)
+        '''修改部分'''
+        self.depth_conv6 = nn.Conv2d(in_channels=512, out_channels=512, kernel_size=3, stride=1, padding=1)
+        self.batchNorm6 = nn.BatchNorm2d(512)
+        self.relu6 = nn.ReLU(inplace=True)
+
+
+        self.pool7 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.relu7 = nn.ReLU(inplace=True)
+
+
+    def forward(self, input):
+        depth0 = self.depth_conv0(input)
+        relu0 = self.relu0(depth0)
+        pool0 = self.pool0(relu0)
+        #print(pool0.size())
+
+        depth1 = self.depth_conv1(pool0)
+        relu1 = self.relu1(depth1)
+        pool1 = self.pool1(relu1)
+        #print(pool1.size())
+
+        depth2 = self.depth_conv2(pool1)
+        batchNormal2 = self.batchNorm2(depth2)
+        relu2 = self.relu2(batchNormal2)
+        #print(relu2.size())
+
+        depth3 = self.depth_conv3(relu2)
+        relu3 = self.relu3(depth3)
+        pool3 = self.pool3(relu3)
+        #print(pool3.size())
+
+        depth4 = self.depth_conv4(pool3)
+        batchNormal4 = self.batchNorm4(depth4)
+        relu4 = self.relu4(batchNormal4)
+        #print(relu4.size())
+
+        depth5 = self.depth_conv5(relu4)
+        relu5 = self.relu5(depth5)
+        pool5 = self.pool5(relu5)
+        #print(pool5.size())
+
+        depth6 = self.depth_conv6(pool5)
+        batchNormal6 = self.batchNorm6(depth6)
+        relu6 = self.relu6(batchNormal6)
+        #print(relu6.size())
+        '''修改部分'''
+        pool7 = self.pool7(relu6)
+        relu7 = self.relu7(pool7)
+        #print(relu7.size())
+
+        return relu7
+
+
+
+class CRNN(nn.Module):
+    def __init__(self, imgHeight, nChannel, nClass, nHidden):
+        super(CRNN, self).__init__()
+
+        self.cnn = nn.Sequential(CNN(imgHeight, nChannel))
+        self.lstm = nn.Sequential(
+            BidirectionalLSTM(512, nHidden, nHidden),
+            BidirectionalLSTM(nHidden, nHidden, nClass),
+        )
+
+    def forward(self, input):
+        conv = self.cnn(input)  # [B,C,1,W]
+        # pytorch框架输出结构为BCHW
+        batch, channel, height, width = conv.size()
+        assert height == 1, "the output height must be 1."
+        # 将height==1的维度去掉-->BCW
+        conv = conv.squeeze(dim=2)
+        # 调整各个维度的位置(B,C,W)->(W,B,C)，对应lstm的输入(seq,batch,input_size)
+        conv = conv.permute(2, 0, 1)
+
+        output = self.lstm(conv)  # [W,B,num_classes]
+        output = torch.log_softmax(output, dim=2)
+        return output
+
+
+# 实例化网络，并创建损失函数和优化器---------------------------------------------------------
+model = CRNN(32, 1, len(CHARS), 256)
+model = model.to(device)
+# 定义损失函数
+criterion = nn.CTCLoss(blank=len(CHARS) - 1)
+criterion = criterion.to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+out_len = torch.full(size=(batch_size,), fill_value=12, dtype=torch.long)
+tar_len = torch.full(size=(batch_size,), fill_value=target_len, dtype=torch.long)
+
+
+# 定义训练函数------------------------------------------------------------
+def train(epoch):
+    running_loss = 0
+    for inputs, target in train_loader:
+        # inputs, target = data
+        inputs = inputs.to(device)
+        target = target.to(device)
+        outputs = model(inputs)
+        outputs = outputs.log_softmax(2).requires_grad_()
+        #print(outputs.size())
+        #outputs = output_transform(outputs, batch_size, 3 * target_len, len(CHARS)).log_softmax(2).requires_grad_()
+        # target = target.view(-1)
+        loss = criterion(outputs, target, out_len, tar_len)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    print('[%d / %d]: running loss: %.6f' % (epoch + 1, EPOCH, running_loss))
+
+
+# 定义测试函数--------------------------------------------------------------------
+def test(epoch):
+    correct = 0
+    with torch.no_grad():  # 测试集不用算梯度
+        for data in test_loader:
+            images, labels = data
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = model(images)
+            outputs = outputs.permute(1, 0, 2)
+            #outputs = outputs.reshape(shape=(batch_size, 3 * target_len, len(CHARS)))
+            for i in range(outputs.shape[0]):
+                label = ''
+                final = ''
+                output_result = outputs[i, :, :]
+                output_result = torch.argmax(output_result, dim=1)
+                label_mid = [CHARS[i] for i in output_result if CHARS[i] != '_']
+                for key, _ in itertools.groupby(label_mid):
+                    final += key
+                for idx in labels[i]:
+                    label += CHARS[int(idx)]
+                if final == label:
+                    correct += 1
+            # correct += (pred == labels).sum().item()
+    acc = correct / len(test_loader.dataset)
+    print('[%d / %d]: Accuracy on test set: %.2f %% ' % (epoch + 1, EPOCH, 100 * acc))  # 求测试的准确率，正确数/总数
+    return acc
+
+
+
+# main fuc----------------------------------------------------------------------------------------
+if __name__ == '__main__':
+
+    acc_list_test = []
+    for epoch in range(EPOCH):
+        train(epoch)
+        acc_test = test(epoch)
+        acc_list_test.append(acc_test)
+    #print(acc_list_test)
+
+    plt.plot(acc_list_test)
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy On TestSet')
+    plt.show()
