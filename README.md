@@ -1,0 +1,2 @@
+# crnn_ctcloss_verifi_code
+使用crnn及ctcloss对不定长验证码进行识别
